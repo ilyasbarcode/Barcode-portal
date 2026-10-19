@@ -73,6 +73,7 @@ def get_connection():
         """
         CREATE TABLE IF NOT EXISTS barcode_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_number TEXT NOT NULL DEFAULT '',
             barcode TEXT NOT NULL,
             creation_date TEXT NOT NULL,
             resolve_date TEXT NOT NULL,
@@ -80,6 +81,13 @@ def get_connection():
         )
         """
     )
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(barcode_history)").fetchall()
+    }
+    if "order_number" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE barcode_history ADD COLUMN order_number TEXT NOT NULL DEFAULT ''"
+        )
     conn.commit()
     return conn
 
@@ -87,10 +95,20 @@ def get_connection():
 def load_history():
     conn = get_connection()
     try:
-        history = pd.read_sql_query(
-            "SELECT barcode, creation_date, resolve_date FROM barcode_history",
-            conn
-        )
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(barcode_history)").fetchall()
+        }
+        if "order_number" in columns:
+            history = pd.read_sql_query(
+                "SELECT order_number, barcode, creation_date, resolve_date FROM barcode_history",
+                conn
+            )
+        else:
+            history = pd.read_sql_query(
+                "SELECT barcode, creation_date, resolve_date FROM barcode_history",
+                conn
+            )
+            history["order_number"] = ""
     finally:
         conn.close()
 
@@ -103,6 +121,7 @@ def load_history():
         resolve = pd.to_datetime(row["resolve_date"], errors="coerce")
         if pd.notna(creation) and pd.notna(resolve):
             records.append({
+                "Order Number": str(row.get("order_number", "") or ""),
                 "Barcode": str(row["barcode"]),
                 "Creation Date": creation,
                 "Resolve Date": resolve
@@ -117,11 +136,12 @@ def save_history(rows):
         conn.executemany(
             """
             INSERT OR IGNORE INTO barcode_history
-                (barcode, creation_date, resolve_date)
-            VALUES (?, ?, ?)
+                (order_number, barcode, creation_date, resolve_date)
+            VALUES (?, ?, ?, ?)
             """,
             [
                 (
+                    str(row.get("Order Number", "") or ""),
                     str(row["Barcode"]),
                     pd.Timestamp(row["Creation Date"]).strftime("%Y-%m-%d %H:%M:%S"),
                     pd.Timestamp(row["Resolve Date"]).strftime("%Y-%m-%d %H:%M:%S")
@@ -160,6 +180,7 @@ def check_barcodes(input_df, saved_history):
         ]
 
         previous_resolve = None
+        previous_order_number = ""
         days_between = None
 
         if not earlier:
@@ -167,6 +188,7 @@ def check_barcodes(input_df, saved_history):
         else:
             previous = max(earlier, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
             previous_resolve = pd.Timestamp(previous["Resolve Date"])
+            previous_order_number = str(previous.get("Order Number", "") or "")
             days_between = (creation.normalize() - previous_resolve.normalize()).days
 
             if creation.normalize() < previous_resolve.normalize():
@@ -179,6 +201,7 @@ def check_barcodes(input_df, saved_history):
                 result = "After 90 Days"
 
         out = row.drop(labels=["__original_order"]).to_dict()
+        out["Previous Order Number"] = previous_order_number
         out["Previous Resolve Date"] = previous_resolve
         out["Days Between Complaints"] = days_between
         out["Result"] = result
@@ -186,6 +209,7 @@ def check_barcodes(input_df, saved_history):
 
         # Include this complaint when checking later rows in the same Excel upload.
         previous_records.append({
+            "Order Number": str(row.get("Order Number", "") or ""),
             "Barcode": barcode,
             "Creation Date": creation,
             "Resolve Date": resolve
@@ -196,7 +220,8 @@ def check_barcodes(input_df, saved_history):
     # Keep a friendly column order while preserving any extra input columns.
     preferred = [
         "Order Number", "Barcode", "Creation Date", "Resolve Date",
-        "Previous Resolve Date", "Days Between Complaints", "Result"
+        "Previous Order Number", "Previous Resolve Date",
+        "Days Between Complaints", "Result"
     ]
     ordered = [col for col in preferred if col in result_df.columns]
     ordered += [col for col in result_df.columns if col not in ordered]
