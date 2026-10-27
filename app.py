@@ -205,7 +205,7 @@ def save_history(rows):
 
 
 def check_barcodes(input_df, saved_history):
-    """Check repeated same-barcode/same-material warranty; output one Result column."""
+    """Check each warranty category independently and show separate result columns."""
     working = input_df.copy()
     working["__original_order"] = range(len(working))
     working = working.sort_values(["Creation Date", "__original_order"], kind="stable")
@@ -219,6 +219,7 @@ def check_barcodes(input_df, saved_history):
         resolve = pd.Timestamp(row["Resolve Date"])
         remarks = str(row.get("Remarks", "") or "")
         materials = detect_materials(remarks)
+
         current_parts = [m for m in materials if is_part(m)]
         current_has_compressor = "Compressor" in materials
         current_has_gas = "Gas" in materials
@@ -231,89 +232,113 @@ def check_barcodes(input_df, saved_history):
         ]
         earlier.sort(key=lambda rec: pd.Timestamp(rec["Creation Date"]), reverse=True)
 
-        # Check only exact canonical material repeats; unrelated parts do not match.
-        matches = []
-        for material in materials:
-            same_material_history = [
-                rec for rec in earlier
-                if material in rec.get("Materials", detect_materials(rec.get("Remarks", "")))
-            ]
-            if same_material_history:
-                prev = max(same_material_history, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
-                label, days = gap_result(creation, prev["Resolve Date"])
-                matches.append({
-                    "material": material,
-                    "previous": prev,
-                    "label": label,
-                    "days": days,
-                })
+        compressor_result = ""
+        gas_result = ""
+        parts_result = ""
+        service_result = ""
 
-        # Priority applies to warranty matches, not merely to words in Remarks:
-        # a non-repeated compressor must not hide a repeated relay/other part.
-        chosen = None
-        for priority_material in ["Compressor", "Gas"]:
-            candidates = [m for m in matches if m["material"] == priority_material]
-            if candidates:
-                chosen = candidates[0]
-                break
-        if chosen is None:
-            part_matches = [m for m in matches if is_part(m["material"])]
+        # Compressor warranty: same barcode + compressor seen before; 90-day period.
+        if current_has_compressor:
+            previous_compressors = [
+                rec for rec in earlier
+                if "Compressor" in rec.get("Materials", detect_materials(rec.get("Remarks", "")))
+            ]
+            if previous_compressors:
+                prev = max(previous_compressors, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
+                label, days = gap_result(creation, prev["Resolve Date"])
+                if label == "Created Before Previous Resolve":
+                    compressor_result = label
+                elif days <= 90:
+                    compressor_result = "Within 90 Days"
+                else:
+                    compressor_result = "After 90 Days"
+            else:
+                compressor_result = "No Previous Compressor"
+
+        # Gas warranty: same barcode + gas seen before; 90-day period.
+        if current_has_gas:
+            previous_gas = [
+                rec for rec in earlier
+                if "Gas" in rec.get("Materials", detect_materials(rec.get("Remarks", "")))
+            ]
+            if previous_gas:
+                prev = max(previous_gas, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
+                label, days = gap_result(creation, prev["Resolve Date"])
+                if label == "Created Before Previous Resolve":
+                    gas_result = label
+                elif days <= 90:
+                    gas_result = "Within 90 Days"
+                else:
+                    gas_result = "After 90 Days"
+            else:
+                gas_result = "No Previous Gas"
+
+        # Parts warranty: any same part repeats for the same barcode; 30-day period.
+        if current_parts:
+            part_matches = []
+            for material in current_parts:
+                previous_parts = [
+                    rec for rec in earlier
+                    if material in rec.get("Materials", detect_materials(rec.get("Remarks", "")))
+                ]
+                if previous_parts:
+                    prev = max(previous_parts, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
+                    label, days = gap_result(creation, prev["Resolve Date"])
+                    part_matches.append((label, days))
             if part_matches:
-                chosen = part_matches[0]
-        if chosen is None and current_is_service:
+                # A repeated part is under warranty if any exact part match is within 30 days.
+                if any(label == "Created Before Previous Resolve" for label, _ in part_matches):
+                    parts_result = "Created Before Previous Resolve"
+                elif any(days <= 30 for _, days in part_matches):
+                    parts_result = "Within 30 Days"
+                else:
+                    parts_result = "No Warranty Part"
+            else:
+                parts_result = "No Warranty Part"
+
+        # Service warranty is checked only when no actual part, compressor, or gas
+        # is recorded in the current complaint (CFS Basic Service counts as service).
+        if current_is_service:
             previous_service = [
                 rec for rec in earlier
-                if str(rec.get("Remarks", "") or "").strip()
-                and not [m for m in rec.get("Materials", detect_materials(rec.get("Remarks", ""))) if is_part(m)]
-                and "Compressor" not in rec.get("Materials", detect_materials(rec.get("Remarks", "")))
-                and "Gas" not in rec.get("Materials", detect_materials(rec.get("Remarks", "")))
+                if not rec.get("Materials", detect_materials(rec.get("Remarks", "")))
+                or rec.get("Materials", detect_materials(rec.get("Remarks", ""))) == ["CFS Basic Service"]
             ]
             if previous_service:
                 prev = max(previous_service, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
                 label, days = gap_result(creation, prev["Resolve Date"])
-                chosen = {"material": "Service", "previous": prev, "label": label, "days": days}
-            elif not earlier:
-                chosen = {"material": "Service", "previous": None, "label": "First Service", "days": None}
-
-        previous_order_number = ""
-        previous_resolve = None
-        days_between = None
-        if chosen:
-            previous = chosen["previous"]
-            previous_order_number = str(previous.get("Order Number", "") or "") if previous else ""
-            previous_resolve = pd.Timestamp(previous["Resolve Date"]) if previous else None
-            days_between = chosen["days"]
-            label = chosen["label"]
-            if chosen["material"] == "Compressor":
-                result = f"Compressor Warranty — {label}"
-            elif chosen["material"] == "Gas":
-                result = f"Gas Warranty — {label}"
-            elif chosen["material"] == "Service":
-                result = "Service Warranty — First Service" if label == "First Service" else f"Service Warranty — {label}"
+                if label == "Created Before Previous Resolve":
+                    service_result = label
+                elif days <= 30:
+                    service_result = "Within 30 Days"
+                else:
+                    service_result = "After 30 Days"
             else:
-                result = f"Parts Warranty — {label}"
-        elif current_parts or current_has_compressor or current_has_gas:
-            result = "No Warranty Part"
-            if earlier:
-                previous = earlier[0]
-                previous_order_number = str(previous.get("Order Number", "") or "")
-                previous_resolve = pd.Timestamp(previous["Resolve Date"])
-                days_between = (creation.normalize() - previous_resolve.normalize()).days
-        elif current_is_service:
-            # A service row following a complaint that involved parts is not treated
-            # as a pure service-only history; it is not a repeated part warranty.
-            result = "No Warranty Part" if earlier else "Service Warranty — First Service"
-        else:
-            result = "No Warranty Part"
+                service_result = "First Service"
 
         out = row.drop(labels=["__original_order"]).to_dict()
         out["Detected Materials"] = ", ".join(materials) if materials else "Service"
-        out["Previous Order Number"] = previous_order_number
-        out["Previous Resolve Date"] = previous_resolve
-        out["Days Between Complaints"] = days_between
-        out["Result"] = result
+        out["Compressor Warranty"] = compressor_result
+        out["Gas Warranty"] = gas_result
+        out["Parts Warranty"] = parts_result
+        out["Service Warranty"] = service_result
+
+        # Keep general previous-complaint details for traceability.
+        if earlier:
+            previous = earlier[0]
+            out["Previous Order Number"] = str(previous.get("Order Number", "") or "")
+            out["Previous Resolve Date"] = pd.Timestamp(previous["Resolve Date"])
+            out["Days Between Complaints"] = (
+                creation.normalize() - pd.Timestamp(previous["Resolve Date"]).normalize()
+            ).days
+        else:
+            out["Previous Order Number"] = ""
+            out["Previous Resolve Date"] = None
+            out["Days Between Complaints"] = None
+
         output_rows.append(out)
 
+        # Include this complaint in the working history for later rows in this upload.
         previous_records.append({
             "Order Number": str(row.get("Order Number", "") or ""),
             "Barcode": barcode,
@@ -327,7 +352,8 @@ def check_barcodes(input_df, saved_history):
     preferred = [
         "Order Number", "Barcode", "Creation Date", "Resolve Date", "Remarks",
         "Detected Materials", "Previous Order Number", "Previous Resolve Date",
-        "Days Between Complaints", "Result"
+        "Days Between Complaints", "Compressor Warranty", "Gas Warranty",
+        "Parts Warranty", "Service Warranty"
     ]
     ordered = [col for col in preferred if col in result_df.columns]
     ordered += [col for col in result_df.columns if col not in ordered]
@@ -355,12 +381,12 @@ with st.expander("Rules / Checking Logic"):
     st.markdown(
         """
         - Remarks ke ek cell mein multiple materials ho sakte hain; portal unhein detect karega.
-        - Warranty match ke liye same Barcode aur same detected material zaroori hain.
-        - Priority: Compressor Warranty → Gas Warranty → Parts Warranty → Service Warranty.
-        - Compressor repeat na ho lekin koi doosra same part repeat ho, to Parts Warranty show hogi.
-        - Agar koi part/material repeat na ho aur current complaint mein part laga ho, to No Warranty Part.
-        - Agar na pehle aur na current complaint mein part/material ho, to Service Warranty history check hogi.
-        - 30 days, 90 days aur After 90 Days ka gap current Creation Date minus previous matching complaint Resolve Date hai.
+        - Warranty results alag columns mein aayenge: Compressor, Gas, Parts aur Service.
+        - Compressor Warranty: same barcode aur compressor repeat; warranty period 90 days.
+        - Gas Warranty: same barcode aur gas repeat; warranty period 90 days.
+        - Parts Warranty: same barcode aur same part repeat; warranty period 30 days. Repeat part 30 din se baad aaye to No Warranty Part.
+        - Service Warranty: jab current remarks mein koi part/compressor/gas na ho; service history ka warranty period 30 days hai.
+        - Gap current Creation Date minus previous matching complaint Resolve Date se calculate hota hai.
         - Order Number sirf output/tracking ke liye hai; calculation par asar nahi karta.
         """
     )
