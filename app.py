@@ -459,10 +459,21 @@ if uploaded_file is not None:
     st.subheader("Checking Results")
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Rows", len(result_df))
-    c2.metric("First Complaints", int((result_df["Result"] == "First Complaint").sum()))
-    c3.metric("Within 90 Days", int(result_df["Result"].isin(
-        ["Within 30 Days", "Within 90 Days"]
-    ).sum()))
+    warranty_cols = [
+        "Compressor Warranty", "Gas Warranty", "Parts Warranty", "Service Warranty"
+    ]
+    c2.metric(
+        "Warranty Matches",
+        int(result_df[warranty_cols].apply(
+            lambda col: col.astype(str).str.startswith("Within ")
+        ).sum().sum())
+    )
+    c3.metric(
+        "No Warranty / First",
+        int(result_df[warranty_cols].apply(
+            lambda col: col.astype(str).str.contains("No Warranty|First ", case=False, regex=True)
+        ).sum().sum())
+    )
 
     st.dataframe(result_df, use_container_width=True, hide_index=True)
 
